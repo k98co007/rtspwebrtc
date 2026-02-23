@@ -30,6 +30,13 @@ ENV/
 env/
 .venv/
 
+# Allow committing root-level binary files (DLL/PYD/EXP/LIB)
+# Negations must come after ignore patterns above
+!/*.dll
+!/*.pyd
+!/*.exp
+!/*.lib
+
 # dotenv
 .env
 .env.*
@@ -75,10 +82,7 @@ cmake-build-*/
 *.vcxproj*
 *.sln
 *.filters
-*.exp
 *.obj
-*.lib
-*.dll
 *.exe
 *.pdb
 
