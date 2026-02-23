@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transcoding Viewer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background:#111; color:#eee; }
+    .row { display:flex; gap:8px; margin-bottom:12px; }
+    input { flex:1; padding:10px; border-radius:8px; border:1px solid #555; background:#1d1d1d; color:#fff; }
+    button { padding:10px 14px; border-radius:8px; border:none; cursor:pointer; }
+    video { width:100%; max-width:980px; border:1px solid #333; border-radius:10px; background:#000; }
+    #log { margin-top:10px; color:#9fc3ff; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>RTSP → WebRTC (Transcoding)</h2>
+  <div class="row">
+    <input id="rtspUrl" value="rtsp://210.99.70.120:1935/live/cctv005.stream" />
+    <button id="startBtn">시작</button>
+    <button id="stopBtn" disabled>중지</button>
+  </div>
+  <video id="video" autoplay playsinline controls muted></video>
+  <div id="log">대기 중...</div>
+  <script>
+    const rtspUrl = document.getElementById('rtspUrl');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const video = document.getElementById('video');
+    const logEl = document.getElementById('log');
+    let pc = null;
+    let sessionId = null;
+
+    const log = (m) => logEl.textContent = `[${new Date().toLocaleTimeString()}] ${m}`;
+
+    async function stop() {
+      if (sessionId) {
+        try {
+          await fetch('/api/stop', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sessionId}) });
+        } catch (e) {}
+      }
+      if (pc) pc.close();
+      pc = null;
+      sessionId = null;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      log('중지됨');
+    }
+
+    async function start() {
+      const url = rtspUrl.value.trim();
+      if (!url) return;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      log('연결 중...');
+
+      pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+      pc.addTransceiver('video', { direction:'recvonly' });
+      pc.ontrack = (e) => { video.srcObject = e.streams[0]; };
+      pc.onconnectionstatechange = () => log(`WebRTC 상태: ${pc.connectionState}`);
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const res = await fetch('/api/offer', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({ rtspUrl:url, sdp:pc.localDescription.sdp, type:pc.localDescription.type })
+        });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `server ${res.status}`);
+        const ans = await res.json();
+        sessionId = ans.sessionId;
+        await pc.setRemoteDescription({ type: ans.type, sdp: ans.sdp });
+        log('재생 시작됨');
+      } catch (e) {
+        log(`오류: ${e.message}`);
+        await stop();
+      }
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    window.addEventListener('beforeunload', stop);
+  </script>
+</body>
+</html>

@@ -1,0 +1,96 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Installer logs
+pip-log.txt
+
+# Unit test / coverage
+.pytest_cache/
+.mypy_cache/
+.cache
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# dotenv
+.env
+.env.*
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Editor directories and files
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.tmp
+*~
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints
+
+# Logs
+*.log
+
+# C/C++ / build artifacts
+# Visual Studio and CMake build outputs
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+cmake-build-*/
+**/build/
+**/Release/
+**/Debug/
+**/RelWithDebInfo/
+**/MinSizeRel/
+*.vcxproj*
+*.sln
+*.filters
+*.exp
+*.obj
+*.lib
+*.dll
+*.exe
+*.pdb
+
+# Third-party build directories
+third_party/build/
+cpp/build/
+
+# Ignore python egg and eggs
+*.egg
+
+# pyenv
+.python-version
+
+# local virtualenv wrappers
+.venv/

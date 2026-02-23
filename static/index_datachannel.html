@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DataChannel Viewer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background:#111; color:#eee; }
+    .row { display:flex; gap:8px; margin-bottom:12px; }
+    input { flex:1; padding:10px; border-radius:8px; border:1px solid #555; background:#1d1d1d; color:#fff; }
+    button { padding:10px 14px; border-radius:8px; border:none; cursor:pointer; }
+    canvas { width:100%; max-width:980px; border:1px solid #333; border-radius:10px; background:#000; }
+    #log { margin-top:10px; color:#9fc3ff; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>RTSP → WebRTC DataChannel (WebCodecs)</h2>
+  <div class="row">
+    <input id="rtspUrl" value="rtsp://210.99.70.120:1935/live/cctv005.stream" />
+    <button id="startBtn">시작</button>
+    <button id="stopBtn" disabled>중지</button>
+  </div>
+  <canvas id="canvas" width="1280" height="720"></canvas>
+  <div id="log">대기 중...</div>
+  <script>
+    const rtspUrl = document.getElementById('rtspUrl');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const logEl = document.getElementById('log');
+
+    let pc = null;
+    let dc = null;
+    let decoder = null;
+    let decoderConfigured = false;
+    let sessionId = null;
+    let firstKey = false;
+    let frameBuffer = new Map();
+
+    const log = (m) => {
+      logEl.textContent = `[${new Date().toLocaleTimeString()}] ${m}`;
+      console.log(`[DataChannel] ${m}`);
+    };
+
+    function concatChunks(chunks) {
+      let total = 0;
+      for (const c of chunks) total += c.length;
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.length; }
+      return out;
+    }
+
+    async function ensureDecoder(codec) {
+      log(`ensureDecoder called with codec=${codec}`);
+      if (!('VideoDecoder' in window)) throw new Error('WebCodecs 미지원 브라우저');
+      if (decoderConfigured) return;
+      const candidates = [codec, 'avc1.42e01f', 'avc1.42001f'].filter(Boolean);
+      let selected = null;
+      for (const c of candidates) {
+        try {
+          const support = await VideoDecoder.isConfigSupported({ codec: c, optimizeForLatency: true });
+          log(`VideoDecoder.isConfigSupported(${c}) = ${JSON.stringify(support)}`);
+          if (support.supported) { selected = c; break; }
+        } catch (e) { log(`isConfigSupported error for ${c}: ${e.message || e}`); }
+      }
+      if (!selected) throw new Error('지원 codec 없음');
+
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          log(`Decoded frame: displayWidth=${frame.displayWidth}, displayHeight=${frame.displayHeight}`);
+          canvas.width = frame.displayWidth || canvas.width;
+          canvas.height = frame.displayHeight || canvas.height;
+          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          frame.close();
+        },
+        error: (e) => log(`Decoder 오류: ${e.message || e}`),
+      });
+      decoder.configure({ codec: selected, optimizeForLatency: true });
+      decoderConfigured = true;
+      log(`Decoder configured with codec=${selected}`);
+    }
+
+    async function handleBinary(buf) {
+      log(`handleBinary called, buf.length=${buf.byteLength}`);
+      const view = new DataView(buf);
+      if (view.byteLength < 18) { log('Binary too short'); return; }
+      if (view.getUint8(0) !== 1) { log('Unknown message type'); return; }
+      const frameId = view.getUint32(1, false);
+      const chunkIndex = view.getUint16(5, false);
+      const chunkCount = view.getUint16(7, false);
+      const isKey = view.getUint8(9) === 1;
+      const ts = Number(view.getBigUint64(10, false));
+      const payload = new Uint8Array(buf.slice(18));
+
+      log(`frameId=${frameId} chunkIndex=${chunkIndex} chunkCount=${chunkCount} isKey=${isKey} ts=${ts} payload.length=${payload.length}`);
+
+      if (!frameBuffer.has(frameId)) {
+        frameBuffer.set(frameId, { chunks:new Array(chunkCount), received:0, chunkCount, isKey, ts });
+        log(`New frameBuffer entry for frameId=${frameId}`);
+      }
+      const frame = frameBuffer.get(frameId);
+      if (!frame || chunkIndex >= frame.chunkCount) { log('Invalid frame or chunk index'); return; }
+      if (!frame.chunks[chunkIndex]) {
+        frame.chunks[chunkIndex] = payload;
+        frame.received += 1;
+        log(`Chunk received for frameId=${frameId} chunkIndex=${chunkIndex} received=${frame.received}`);
+      }
+      if (frame.received < frame.chunkCount) { log(`Waiting for more chunks: frameId=${frameId} received=${frame.received}/${frame.chunkCount}`); return; }
+
+      frameBuffer.delete(frameId);
+      if (frame.isKey) firstKey = true;
+      if (!firstKey) { log('Waiting for first keyframe'); return; }
+      if (!decoderConfigured) { log('Decoder not configured'); return; }
+
+      const data = concatChunks(frame.chunks);
+      log(`Decoding frameId=${frameId} isKey=${frame.isKey} data.length=${data.length}`);
+      try {
+        const chunk = new EncodedVideoChunk({ type: frame.isKey ? 'key' : 'delta', timestamp: frame.ts, data });
+        decoder.decode(chunk);
+      } catch (e) {
+        log(`decode error: ${e.message || e}`);
+      }
+    }
+
+    async function stop() {
+      if (sessionId) {
+        try {
+          await fetch('/api/stop', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sessionId}) });
+        } catch (e) {}
+      }
+      if (decoder) { try { decoder.close(); } catch (e) {} }
+      decoder = null;
+      decoderConfigured = false;
+      firstKey = false;
+      frameBuffer.clear();
+      if (pc) pc.close();
+      pc = null;
+      dc = null;
+      sessionId = null;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      log('중지됨');
+    }
+
+    async function start() {
+      const url = rtspUrl.value.trim();
+      if (!url) return;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      log('연결 중...');
+
+      pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+      dc = pc.createDataChannel('h264', { ordered:true });
+      dc.binaryType = 'arraybuffer';
+      dc.onopen = () => {
+        log('DataChannel open');
+        try { dc.send(JSON.stringify({ type:'client-ready', ts: Date.now() })); } catch (e) { log('client-ready send error: ' + (e.message || e)); }
+      };
+      dc.onerror = (e) => log(`DataChannel 오류: ${e.message || e.type || e}`);
+      dc.onclose = () => log('DataChannel close');
+      dc.onmessage = async (event) => {
+        log(`DataChannel message received: type=${typeof event.data}`);
+        if (typeof event.data === 'string') {
+          log(`DataChannel string message: ${event.data}`);
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'init') {
+              log(`init message received: codec=${msg.codec}`);
+              await ensureDecoder(msg.codec || 'avc1.42e01f');
+            }
+          } catch (e) { log('init message parse error: ' + (e.message || e)); }
+          return;
+        }
+        if (event.data instanceof ArrayBuffer) { log('ArrayBuffer received'); await handleBinary(event.data); }
+        if (event.data instanceof Blob) { log('Blob received'); await handleBinary(await event.data.arrayBuffer()); }
+      };
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const res = await fetch('/api/offer', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({ rtspUrl:url, sdp:pc.localDescription.sdp, type:pc.localDescription.type })
+        });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `server ${res.status}`);
+        const ans = await res.json();
+        sessionId = ans.sessionId;
+        await pc.setRemoteDescription({ type: ans.type, sdp: ans.sdp });
+        log(`시작됨 (profile=${ans.profileLevelId || '-'})`);
+      } catch (e) {
+        log(`오류: ${e.message}`);
+        await stop();
+      }
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    window.addEventListener('beforeunload', stop);
+  </script>
+</body>
+</html>

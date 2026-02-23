@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Passthrough Viewer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background:#111; color:#eee; }
+    .row { display:flex; gap:8px; margin-bottom:12px; }
+    input { flex:1; padding:10px; border-radius:8px; border:1px solid #555; background:#1d1d1d; color:#fff; }
+    button { padding:10px 14px; border-radius:8px; border:none; cursor:pointer; }
+    video { width:100%; max-width:980px; border:1px solid #333; border-radius:10px; background:#000; }
+    #log { margin-top:10px; color:#9fc3ff; white-space:pre-wrap; }
+    #debug { margin-top:10px; color:#ffd166; white-space:pre-wrap; font-size:12px; border:1px solid #333; border-radius:8px; padding:10px; max-width:980px; }
+  </style>
+</head>
+<body>
+  <h2>RTSP → WebRTC (Passthrough)</h2>
+  <div class="row">
+    <input id="rtspUrl" value="rtsp://210.99.70.120:1935/live/cctv005.stream" />
+    <button id="startBtn">시작</button>
+    <button id="stopBtn" disabled>중지</button>
+  </div>
+  <video id="video" autoplay playsinline controls muted></video>
+  <div id="log">대기 중...</div>
+  <div id="debug">브라우저 디버그 대기 중...</div>
+  <script>
+    const rtspUrl = document.getElementById('rtspUrl');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const video = document.getElementById('video');
+    const logEl = document.getElementById('log');
+    const debugEl = document.getElementById('debug');
+    let pc = null;
+    let sessionId = null;
+    let statsTimer = null;
+    let lastDebug = '';
+
+    function codecListFromCaps(caps) {
+      const codecs = (caps && caps.codecs) ? caps.codecs : [];
+      return codecs.filter((c) => String(c?.mimeType || '').toLowerCase().startsWith('video/'));
+    }
+
+    function filterH264Codecs(codecList) {
+      return codecList.filter((c) => String(c?.mimeType || '').toLowerCase() === 'video/h264');
+    }
+
+    function summarizeCodecs(codecList) {
+      return codecList.map((c) => `${String(c?.mimeType || '').toLowerCase()}${c?.sdpFmtpLine ? `;${c.sdpFmtpLine}` : ''}`);
+    }
+
+    const log = (m) => logEl.textContent = `[${new Date().toLocaleTimeString()}] ${m}`;
+    const debug = (m) => {
+      lastDebug = `[${new Date().toLocaleTimeString()}] ${m}`;
+      debugEl.textContent = lastDebug;
+    };
+
+    function mediaErrorText(err) {
+      if (!err) return 'unknown';
+      const code = err.code;
+      if (code === 1) return 'MEDIA_ERR_ABORTED';
+      if (code === 2) return 'MEDIA_ERR_NETWORK';
+      if (code === 3) return 'MEDIA_ERR_DECODE';
+      if (code === 4) return 'MEDIA_ERR_SRC_NOT_SUPPORTED';
+      return `MEDIA_ERR_${code}`;
+    }
+
+    async function pollStats() {
+      if (!pc) return;
+      try {
+        const report = await pc.getStats();
+        let inbound = null;
+        let codec = null;
+        for (const stat of report.values()) {
+          if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+            inbound = stat;
+            if (stat.codecId) codec = report.get(stat.codecId) || null;
+            break;
+          }
+        }
+        if (!inbound) {
+          debug('inbound-rtp(video) 없음');
+          return;
+        }
+        const fmtp = codec?.sdpFmtpLine || '-';
+        debug(`framesDecoded=${inbound.framesDecoded ?? '-'} keyFramesDecoded=${inbound.keyFramesDecoded ?? '-'} packetsReceived=${inbound.packetsReceived ?? '-'} bytesReceived=${inbound.bytesReceived ?? '-'} pliCount=${inbound.pliCount ?? '-'} nackCount=${inbound.nackCount ?? '-'} codec=${codec?.mimeType || '-'} fmtp=${fmtp}`);
+      } catch (e) {
+        debug(`getStats 오류: ${e.message || e}`);
+      }
+    }
+
+    async function stop() {
+      if (sessionId) {
+        try {
+          await fetch('/api/stop', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sessionId}) });
+        } catch (e) {}
+      }
+      if (pc) pc.close();
+      pc = null;
+      sessionId = null;
+      if (statsTimer) {
+        clearInterval(statsTimer);
+        statsTimer = null;
+      }
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      log('중지됨');
+    }
+
+    async function start() {
+      const url = rtspUrl.value.trim();
+      if (!url) return;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      log('연결 중...');
+
+      pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+      const videoTransceiver = pc.addTransceiver('video', { direction:'recvonly' });
+
+      if (typeof videoTransceiver.setCodecPreferences === 'function') {
+        const recvCaps = (typeof RTCRtpReceiver !== 'undefined' && typeof RTCRtpReceiver.getCapabilities === 'function')
+          ? RTCRtpReceiver.getCapabilities('video')
+          : null;
+        const sendCaps = (typeof RTCRtpSender !== 'undefined' && typeof RTCRtpSender.getCapabilities === 'function')
+          ? RTCRtpSender.getCapabilities('video')
+          : null;
+
+        const recvCodecs = codecListFromCaps(recvCaps);
+        const sendCodecs = codecListFromCaps(sendCaps);
+        const recvH264 = filterH264Codecs(recvCodecs);
+        const sendH264 = filterH264Codecs(sendCodecs);
+
+        const pref = recvH264.length ? recvH264 : sendH264;
+        if (!pref.length) {
+          debug(`recv codecs=${JSON.stringify(summarizeCodecs(recvCodecs))}`);
+          throw new Error('브라우저 WebRTC capability에 H264가 없습니다. 이 브라우저에서는 passthrough(H264)가 불가합니다.');
+        }
+
+        videoTransceiver.setCodecPreferences(pref);
+        debug(`offer codec forced: H264 (${pref.length} variants), recvH264=${recvH264.length}, sendH264=${sendH264.length}`);
+      } else {
+        debug('setCodecPreferences 미지원 브라우저: offer 코덱 강제 불가');
+      }
+      pc.ontrack = (e) => {
+        video.srcObject = e.streams[0];
+        debug(`ontrack kind=${e.track?.kind} readyState=${e.track?.readyState}`);
+        if (e.track) {
+          e.track.onmute = () => debug('track mute');
+          e.track.onunmute = () => debug('track unmute');
+          e.track.onended = () => debug('track ended');
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        log(`WebRTC 상태: ${pc.connectionState}`);
+        debug(`pc.connectionState=${pc.connectionState}`);
+      };
+      pc.oniceconnectionstatechange = () => debug(`pc.iceConnectionState=${pc.iceConnectionState}`);
+      pc.onicegatheringstatechange = () => debug(`pc.iceGatheringState=${pc.iceGatheringState}`);
+      pc.onsignalingstatechange = () => debug(`pc.signalingState=${pc.signalingState}`);
+
+      video.onerror = () => debug(`video.onerror ${mediaErrorText(video.error)}`);
+      video.onstalled = () => debug('video stalled');
+      video.onwaiting = () => debug('video waiting');
+      video.onplaying = () => debug('video playing');
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const offeredCodecs = [];
+        for (const line of (pc.localDescription.sdp || '').split('\n')) {
+          const m = line.match(/^a=rtpmap:(\d+)\s+([^/]+)\/(\d+)/i);
+          if (m) offeredCodecs.push(`${m[1]}:${m[2].toUpperCase()}/${m[3]}`);
+        }
+        debug(`offer codecs: ${offeredCodecs.join(', ') || '(none)'}`);
+        if (!/a=rtpmap:\\d+\\s+H264\/90000/i.test(pc.localDescription.sdp || '')) {
+          throw new Error('브라우저가 생성한 offer SDP에 H264가 없습니다');
+        }
+        const res = await fetch('/api/offer', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            rtspUrl:url,
+            sdp:pc.localDescription.sdp,
+            type:pc.localDescription.type,
+            preferPassThrough:true,
+            transportMode:'rtp'
+          })
+        });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `server ${res.status}`);
+        const ans = await res.json();
+        sessionId = ans.sessionId;
+        await pc.setRemoteDescription({ type: ans.type, sdp: ans.sdp });
+        if (statsTimer) clearInterval(statsTimer);
+        statsTimer = setInterval(pollStats, 2000);
+        pollStats();
+        log(`재생 시작됨 (prefixBytes=${ans.prefixBytes ?? 0})`);
+      } catch (e) {
+        log(`오류: ${e.message}`);
+        debug(`start error: ${e.stack || e.message || e}`);
+        await stop();
+      }
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    window.addEventListener('beforeunload', stop);
+  </script>
+</body>
+</html>

@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTSP WebRTC Viewer</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 24px;
+      background: #111;
+      color: #eee;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .row.option {
+      margin-top: -4px;
+      margin-bottom: 12px;
+      align-items: center;
+      font-size: 13px;
+      color: #ccc;
+    }
+    .row.option label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    input {
+      flex: 1;
+      min-width: 280px;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #555;
+      background: #1d1d1d;
+      color: #fff;
+    }
+    button {
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    #startBtn { background: #2f7dff; color: #fff; }
+    #stopBtn { background: #666; color: #fff; }
+    video {
+      width: 100%;
+      max-width: 980px;
+      background: #000;
+      border-radius: 10px;
+      border: 1px solid #333;
+    }
+    #log {
+      margin-top: 12px;
+      font-size: 13px;
+      color: #9fc3ff;
+      white-space: pre-wrap;
+    }
+    #diag {
+      margin-top: 12px;
+      max-width: 980px;
+      border: 1px solid #333;
+      border-radius: 10px;
+      background: #181818;
+      padding: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    #diag ul {
+      margin: 8px 0 0 18px;
+      padding: 0;
+    }
+    .ok { color: #70d17d; }
+    .warn { color: #ffd166; }
+    .bad { color: #ff7b7b; }
+  </style>
+</head>
+<body>
+  <h2>RTSP → WebRTC Viewer</h2>
+  <div class="row">
+    <input id="rtspUrl" value="rtsp://210.99.70.120:1935/live/cctv005.stream" placeholder="rtsp://..." />
+    <button id="startBtn">시작</button>
+    <button id="stopBtn" disabled>중지</button>
+  </div>
+  <div class="row option">
+    <label>
+      전송 모드
+      <select id="transportMode">
+        <option value="rtp" selected>RTP(WebRTC Video)</option>
+        <option value="datachannel">DataChannel(WebCodecs)</option>
+      </select>
+    </label>
+  </div>
+  <div class="row option">
+    <label>
+      <input id="passThroughToggle" type="checkbox" disabled />
+      직접 패스스루 사용(호환 가능 시)
+    </label>
+  </div>
+  <video id="video" autoplay playsinline controls muted></video>
+  <canvas id="dcCanvas" width="1280" height="720" style="display:none; width:100%; max-width:980px; background:#000; border-radius:10px; border:1px solid #333;"></canvas>
+  <div id="log">대기 중...</div>
+  <div id="diag">호환성 진단 대기 중...</div>
+
+  <script>
+    const rtspInput = document.getElementById('rtspUrl');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const videoEl = document.getElementById('video');
+    const dcCanvas = document.getElementById('dcCanvas');
+    const transportModeSelect = document.getElementById('transportMode');
+    const logEl = document.getElementById('log');
+    const diagEl = document.getElementById('diag');
+    const passThroughToggle = document.getElementById('passThroughToggle');
+
+    let pc = null;
+    let sessionId = null;
+    let isRestarting = false;
+    let diagnosticsTimer = null;
+    let browserInboundStats = null;
+    let dataChannel = null;
+    let decoder = null;
+    let decoderConfigured = false;
+    let firstKeyReceived = false;
+    let frameBuffer = new Map();
+    let dcStats = {
+      framesDecoded: 0,
+      decodeErrors: 0,
+      chunksReceived: 0,
+      bytesReceived: 0,
+      keyframesReceived: 0,
+      codec: '-',
+    };
+    const dcCtx = dcCanvas.getContext('2d');
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent = `[${time}] ${message}`;
+    }
+
+    function esc(value) {
+      return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    }
+
+    async function collectBrowserInboundStats() {
+      if (!pc) {
+        return null;
+      }
+      try {
+        const report = await pc.getStats();
+        for (const stat of report.values()) {
+          if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+            return {
+              framesDecoded: stat.framesDecoded ?? 0,
+              keyFramesDecoded: stat.keyFramesDecoded ?? 0,
+              bytesReceived: stat.bytesReceived ?? 0,
+              packetsReceived: stat.packetsReceived ?? 0,
+            };
+          }
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    function resetDataChannelState() {
+      frameBuffer.clear();
+      dcStats = {
+        framesDecoded: 0,
+        decodeErrors: 0,
+        chunksReceived: 0,
+        bytesReceived: 0,
+        keyframesReceived: 0,
+        codec: '-',
+      };
+      firstKeyReceived = false;
+      decoderConfigured = false;
+      if (decoder) {
+        try { decoder.close(); } catch (e) {}
+      }
+      decoder = null;
+      dataChannel = null;
+    }
+
+    function concatChunks(chunks) {
+      let total = 0;
+      for (const chunk of chunks) {
+        total += chunk.length;
+      }
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return merged;
+    }
+
+    async function ensureDecoder(codec, fallbackCodecs = []) {
+      if (!('VideoDecoder' in window)) {
+        throw new Error('이 브라우저는 WebCodecs(VideoDecoder)를 지원하지 않습니다.');
+      }
+      if (decoderConfigured && decoder) {
+        return;
+      }
+
+      const candidates = [codec, ...fallbackCodecs, 'avc1.42e01f', 'avc1.42001f']
+        .filter(Boolean)
+        .filter((value, index, array) => array.indexOf(value) === index);
+
+      let selectedCodec = null;
+      for (const candidate of candidates) {
+        try {
+          if (typeof VideoDecoder.isConfigSupported === 'function') {
+            const support = await VideoDecoder.isConfigSupported({ codec: candidate, optimizeForLatency: true });
+            if (support?.supported) {
+              selectedCodec = candidate;
+              break;
+            }
+          } else {
+            selectedCodec = candidate;
+            break;
+          }
+        } catch (e) {}
+      }
+
+      if (!selectedCodec) {
+        throw new Error(`지원 가능한 H264 codec string이 없습니다. candidates=${candidates.join(',')}`);
+      }
+
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          dcCanvas.width = frame.displayWidth || dcCanvas.width;
+          dcCanvas.height = frame.displayHeight || dcCanvas.height;
+          dcCtx.drawImage(frame, 0, 0, dcCanvas.width, dcCanvas.height);
+          frame.close();
+          dcStats.framesDecoded += 1;
+        },
+        error: (error) => {
+          dcStats.decodeErrors += 1;
+          log(`WebCodecs 오류: ${error.message || error}`);
+        }
+      });
+
+      decoder.configure({
+        codec: selectedCodec,
+        optimizeForLatency: true,
+      });
+      decoderConfigured = true;
+      dcStats.codec = selectedCodec;
+    }
+
+    function handleDcBinaryMessage(arrayBuffer) {
+      const view = new DataView(arrayBuffer);
+      if (view.byteLength < 18) {
+        return;
+      }
+
+      const messageType = view.getUint8(0);
+      if (messageType !== 1) {
+        return;
+      }
+
+      const frameId = view.getUint32(1, false);
+      const chunkIndex = view.getUint16(5, false);
+      const chunkCount = view.getUint16(7, false);
+      const keyFlag = view.getUint8(9) === 1;
+      const timestamp = Number(view.getBigUint64(10, false));
+      const payload = new Uint8Array(arrayBuffer.slice(18));
+
+      dcStats.chunksReceived += 1;
+      dcStats.bytesReceived += payload.length;
+
+      if (!frameBuffer.has(frameId)) {
+        frameBuffer.set(frameId, {
+          chunks: new Array(chunkCount),
+          received: 0,
+          chunkCount,
+          keyFlag,
+          timestamp,
+        });
+      }
+
+      const frame = frameBuffer.get(frameId);
+      if (!frame || chunkIndex >= frame.chunkCount) {
+        return;
+      }
+      if (!frame.chunks[chunkIndex]) {
+        frame.chunks[chunkIndex] = payload;
+        frame.received += 1;
+      }
+
+      if (frame.received < frame.chunkCount) {
+        return;
+      }
+
+      frameBuffer.delete(frameId);
+      const full = concatChunks(frame.chunks);
+      if (frame.keyFlag) {
+        firstKeyReceived = true;
+        dcStats.keyframesReceived += 1;
+      }
+      if (!firstKeyReceived) {
+        return;
+      }
+
+      if (!decoder || !decoderConfigured) {
+        return;
+      }
+
+      try {
+        const chunk = new EncodedVideoChunk({
+          type: frame.keyFlag ? 'key' : 'delta',
+          timestamp: frame.timestamp,
+          data: full,
+        });
+        decoder.decode(chunk);
+      } catch (e) {
+        dcStats.decodeErrors += 1;
+      }
+    }
+
+    function setupDataChannel(channel) {
+      dataChannel = channel;
+      dataChannel.binaryType = 'arraybuffer';
+
+      dataChannel.onopen = () => {
+        log('DataChannel 연결됨');
+        try {
+          dataChannel.send(JSON.stringify({ type: 'client-ready', ts: Date.now() }));
+        } catch (e) {}
+      };
+      dataChannel.onclose = () => {
+        log('DataChannel 종료됨');
+      };
+      dataChannel.onerror = (e) => {
+        log(`DataChannel 오류: ${e.message || e.type || 'unknown'}`);
+      };
+      dataChannel.onmessage = async (event) => {
+        if (typeof event.data === 'string') {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === 'init') {
+              await ensureDecoder(message.codec || 'avc1.42e01f', message.fallbackCodecs || []);
+              log(`DataChannel init codec=${message.codec || '-'} selected=${dcStats.codec}`);
+            }
+          } catch (e) {}
+          return;
+        }
+
+        if (event.data instanceof ArrayBuffer) {
+          handleDcBinaryMessage(event.data);
+          return;
+        }
+
+        if (event.data instanceof Blob) {
+          try {
+            const buffer = await event.data.arrayBuffer();
+            handleDcBinaryMessage(buffer);
+          } catch (e) {}
+        }
+      };
+    }
+
+    function renderDiagnostics(diag) {
+      if (!diag || !diag.compatibility) {
+        diagEl.textContent = '진단 정보 없음';
+        return;
+      }
+
+      const source = diag.source || {};
+      const browser = diag.browser || {};
+      const comp = diag.compatibility || {};
+      const codecMatch = comp.passThroughCodecMatch || {};
+      const direct = !!comp.directPassThroughCompatible;
+      const switchAvailable = comp.passThroughSwitchAvailable !== undefined
+        ? !!comp.passThroughSwitchAvailable
+        : direct;
+      const passRequested = !!comp.passThroughRequested;
+      const passApplied = !!comp.passThroughApplied;
+      const expected = !!comp.expectedPlaybackWithCurrentMode;
+      const reencoding = !!comp.reencodingActive;
+      const reasons = Array.isArray(comp.reasons) ? comp.reasons : [];
+      const browserCodecs = Array.isArray(browser.videoCodecs) ? browser.videoCodecs.join(', ') : '-';
+
+      const runtime = diag.runtime || {};
+      const rtp = runtime.rtp || {};
+      const rtpIncreasingText = runtime.rtpIncreasing === null
+        ? '확인 중'
+        : (runtime.rtpIncreasing ? '증가 중' : '증가 없음');
+      const sdp = diag.sdpComparison || {};
+      const sdpReasons = Array.isArray(sdp.reasons) ? sdp.reasons : [];
+      const fmtp = diag.fmtpComparison || {};
+      const offerFmtp = Array.isArray(fmtp.offerH264Fmtp) ? fmtp.offerH264Fmtp : [];
+      const answerFmtp = Array.isArray(fmtp.answerH264Fmtp) ? fmtp.answerH264Fmtp : [];
+      const fmtpReasons = Array.isArray(fmtp.reasons) ? fmtp.reasons : [];
+      const observation = diag.observation || {};
+      const h264Config = source.h264Config || {};
+      const inbound = browserInboundStats || {};
+      const transportMode = diag.transportMode || transportModeSelect.value;
+
+      const directClass = direct ? 'ok' : 'bad';
+      const expectedClass = expected ? 'ok' : 'bad';
+      const reencodeClass = reencoding ? 'warn' : 'ok';
+
+      passThroughToggle.disabled = !switchAvailable;
+      if (!switchAvailable) {
+        passThroughToggle.checked = false;
+      }
+
+      const reasonHtml = reasons.length
+        ? `<ul>${reasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>`
+        : '<div>-</div>';
+
+      const sdpReasonHtml = sdpReasons.length
+        ? `<ul>${sdpReasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>`
+        : '<div>-</div>';
+
+      const offerFmtpHtml = offerFmtp.length
+        ? `<ul>${offerFmtp.map(r => `<li>${esc(r)}</li>`).join('')}</ul>`
+        : '<div>- (Offer에 H264 fmtp 없음)</div>';
+
+      const answerFmtpHtml = answerFmtp.length
+        ? `<ul>${answerFmtp.map(r => `<li>${esc(r)}</li>`).join('')}</ul>`
+        : '<div>- (Answer에 H264 fmtp 없음)</div>';
+
+      const fmtpReasonHtml = fmtpReasons.length
+        ? `<ul>${fmtpReasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>`
+        : '<div>-</div>';
+
+      diagEl.innerHTML = `
+        <div><b>입력 코덱</b>: ${esc(source.codecNormalized || source.codecName || '알 수 없음')}</div>
+        <div><b>입력 해상도</b>: ${esc(source.width || '-')} x ${esc(source.height || '-')} / fps ${esc(source.fps || '-')}</div>
+        <div><b>브라우저 Offer 코덱</b>: ${esc(browserCodecs)}</div>
+        <div><b>전송 모드</b>: ${esc(transportMode)}</div>
+        <div class="${directClass}"><b>직접 패스스루 호환</b>: ${direct ? '가능' : '어려움'}</div>
+        <div><b>패스스루 요청</b>: ${passRequested ? '요청됨' : '미요청'}</div>
+        <div><b>패스스루 적용</b>: ${passApplied ? '적용됨' : '미적용'}</div>
+        <div><b>패스스루 코덱 매칭</b>: sourceProfile=${esc(codecMatch.sourceProfileLevelId || '-')}, reason=${esc(codecMatch.reason || '-')}</div>
+        <div class="${reencodeClass}"><b>재인코딩 동작</b>: ${reencoding ? '활성화됨(decode=True)' : '비활성화(decode=False)'}</div>
+        <div class="${expectedClass}"><b>현재 설정에서 재생 예상</b>: ${expected ? '가능성 높음' : '실패 가능성 높음'}</div>
+        <hr style="border-color:#333; margin:8px 0;" />
+        <div><b>RTP 증가 여부</b>: ${esc(rtpIncreasingText)}</div>
+        <div><b>RTP bytes/packets</b>: ${esc(rtp.bytesSent || 0)} / ${esc(rtp.packetsSent || 0)}</div>
+        <div><b>IDR 관측</b>: ${runtime.idrSeen ? `예 (count=${esc(runtime.idrCount || 0)})` : '아니오'}</div>
+        <div><b>SPS/PPS 관측</b>: ${runtime.spsSeen ? 'SPS=예' : 'SPS=아니오'}, ${runtime.ppsSeen ? 'PPS=예' : 'PPS=아니오'}</div>
+        <div><b>Payload 관측</b>: packets=${esc(runtime.payloadPacketsSeen || 0)}, keyframe-hint=${esc(runtime.payloadKeyframeHints || 0)}</div>
+        <div><b>Payload 샘플 타입/추출실패</b>: ${esc(runtime.lastSampleType || '-')}, failures=${esc(runtime.payloadExtractFailures || 0)}</div>
+        <div><b>Out-of-band SPS/PPS 주입</b>: ${esc(runtime.oobPrefixInjectedCount || 0)}회 / ${esc(runtime.oobPrefixInjectedBytes || 0)} bytes</div>
+        <div><b>최근 주입 이유</b>: ${esc(runtime.oobPrefixLastReason || '-')}</div>
+        <div><b>RTSP out-of-band SPS/PPS</b>: ${h264Config.present ? `예 (format=${esc(h264Config.format)}, SPS=${esc(h264Config.spsCount || 0)}, PPS=${esc(h264Config.ppsCount || 0)})` : '아니오'}</div>
+        <div><b>관측 판정</b>: ${esc(observation.summary || '-')}</div>
+        <hr style="border-color:#333; margin:8px 0;" />
+        <div><b>브라우저 디코드 통계(frames/keyframes)</b>: ${esc(inbound.framesDecoded ?? '-')} / ${esc(inbound.keyFramesDecoded ?? '-')}</div>
+        <div><b>브라우저 수신 bytes/packets</b>: ${esc(inbound.bytesReceived ?? '-')} / ${esc(inbound.packetsReceived ?? '-')}</div>
+        <div><b>DataChannel 디코드(frames/errors)</b>: ${esc(dcStats.framesDecoded)} / ${esc(dcStats.decodeErrors)}</div>
+        <div><b>DataChannel 수신(chunks/bytes/keyframes)</b>: ${esc(dcStats.chunksReceived)} / ${esc(dcStats.bytesReceived)} / ${esc(dcStats.keyframesReceived)}</div>
+        <div><b>DataChannel codec</b>: ${esc(dcStats.codec)}</div>
+        <div><b>DataChannel 상태(서버 진단)</b>: state=${esc(runtime.dcState || '-')}, opened=${esc(runtime.dcOpened)}, clientMsg=${esc(runtime.dcMessagesFromClient || 0)}, error=${esc(runtime.dcLastError || '-')}</div>
+        <hr style="border-color:#333; margin:8px 0;" />
+        <div><b>SDP 비교 (codec / packetization / profile-level-id)</b>:</div>
+        <div>${esc(sdp.codecMatch)} / ${esc(sdp.packetizationModeMatch)} / ${esc(sdp.profileLevelIdMatch)}</div>
+        <div><b>SDP 비교 사유</b>:</div>
+        ${sdpReasonHtml}
+        <hr style="border-color:#333; margin:8px 0;" />
+        <div><b>FMTP 비교 (Offer vs Answer)</b>:</div>
+        <div><b>Offer H264 fmtp</b>:</div>
+        ${offerFmtpHtml}
+        <div><b>Answer H264 fmtp</b>:</div>
+        ${answerFmtpHtml}
+        <div><b>FMTP 일치 (packetization / profile-level-id)</b>: ${esc(fmtp.packetizationModeMatch)} / ${esc(fmtp.profileLevelIdMatch)}</div>
+        <div><b>FMTP 비교 사유</b>:</div>
+        ${fmtpReasonHtml}
+        <div><b>상세 이유</b>:</div>
+        ${reasonHtml}
+      `;
+    }
+
+    async function pollDiagnostics() {
+      if (!sessionId) {
+        return;
+      }
+      try {
+        const res = await fetch(`/api/session/${sessionId}/diagnostics`);
+        if (!res.ok) {
+          if (res.status === 404) {
+            sessionId = null;
+            if (diagnosticsTimer) {
+              clearInterval(diagnosticsTimer);
+              diagnosticsTimer = null;
+            }
+          }
+          return;
+        }
+        const data = await res.json();
+        browserInboundStats = await collectBrowserInboundStats();
+        renderDiagnostics(data.diagnostics);
+      } catch (e) {}
+    }
+
+    async function stop() {
+      if (sessionId) {
+        try {
+          await fetch('/api/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId })
+          });
+        } catch (e) {}
+      }
+
+      if (pc) {
+        pc.ontrack = null;
+        pc.onconnectionstatechange = null;
+        pc.close();
+      }
+
+      resetDataChannelState();
+
+      pc = null;
+      sessionId = null;
+      browserInboundStats = null;
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      if (diagnosticsTimer) {
+        clearInterval(diagnosticsTimer);
+        diagnosticsTimer = null;
+      }
+      log('중지됨');
+    }
+
+    async function start() {
+      if (isRestarting) {
+        return;
+      }
+
+      const rtspUrl = rtspInput.value.trim();
+      if (!rtspUrl) {
+        log('RTSP 주소를 입력하세요.');
+        return;
+      }
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      diagEl.textContent = '호환성 진단 중...';
+      log('연결 준비 중...');
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      const mode = transportModeSelect.value;
+      if (mode === 'rtp') {
+        videoEl.style.display = 'block';
+        dcCanvas.style.display = 'none';
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.ontrack = (event) => {
+          videoEl.srcObject = event.streams[0];
+        };
+      } else {
+        videoEl.style.display = 'none';
+        dcCanvas.style.display = 'block';
+        resetDataChannelState();
+        const outboundDc = pc.createDataChannel('h264', { ordered: true });
+        setupDataChannel(outboundDc);
+      }
+
+      pc.onconnectionstatechange = () => {
+        log(`WebRTC 상태: ${pc.connectionState}`);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          stop();
+        }
+      };
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        const res = await fetch('/api/offer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            rtspUrl,
+            sdp: pc.localDescription.sdp,
+            type: pc.localDescription.type,
+            preferPassThrough: passThroughToggle.checked,
+            transportMode: mode
+          })
+        });
+
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.detail || `server error ${res.status}`);
+        }
+
+        const answer = await res.json();
+        sessionId = answer.sessionId;
+        browserInboundStats = await collectBrowserInboundStats();
+        renderDiagnostics(answer.diagnostics);
+        if (diagnosticsTimer) {
+          clearInterval(diagnosticsTimer);
+        }
+        diagnosticsTimer = setInterval(pollDiagnostics, 2000);
+
+        await pc.setRemoteDescription({ type: answer.type, sdp: answer.sdp });
+        log('재생 시작됨');
+      } catch (error) {
+        diagEl.textContent = '진단 실패';
+        log(`오류: ${error.message}`);
+        await stop();
+      }
+    }
+
+    async function restartWithCurrentMode() {
+      if (!sessionId || isRestarting) {
+        return;
+      }
+
+      isRestarting = true;
+      log('모드 변경으로 재시작 중...');
+      try {
+        await stop();
+        await start();
+      } finally {
+        isRestarting = false;
+      }
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    passThroughToggle.addEventListener('change', restartWithCurrentMode);
+    transportModeSelect.addEventListener('change', restartWithCurrentMode);
+    window.addEventListener('beforeunload', stop);
+  </script>
+</body>
+</html>
